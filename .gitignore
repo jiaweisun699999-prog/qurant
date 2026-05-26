@@ -41,3 +41,9 @@ _templates
 # Alpha
 lab/
 /.mypy_cache
+
+# Virtual Environments
+venv/
+venv_quant/
+.venv/
+ENV/
