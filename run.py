@@ -1,3 +1,8 @@
+# ── NumPy 2.0 兼容性补丁 (修复 empyrical 库调用 np.NINF 崩溃问题) ───
+import numpy as np
+if not hasattr(np, "NINF"):
+    np.NINF = -np.inf
+
 from vnpy.event import EventEngine
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.ui import MainWindow, create_qapp
@@ -52,6 +57,11 @@ def main():
     # ── 注册应用模块 ───────────────────────────────────────────────────
     main_engine.add_app(CtaStrategyApp)
     main_engine.add_app(CtaBacktesterApp)
+    
+    # 注册批量回测模块（支持多股增量同步与一键双击细节复盘）
+    from vnpy_batchbacktester import BatchBacktesterApp
+    main_engine.add_app(BatchBacktesterApp)
+    
     # main_engine.add_app(SpreadTradingApp)
     main_engine.add_app(AlgoTradingApp)
     # main_engine.add_app(PortfolioStrategyApp)
