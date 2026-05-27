@@ -930,8 +930,8 @@ class BatchBacktestApp(QtWidgets.QMainWindow):
         
         left_layout.addWidget(QtWidgets.QLabel("📋 批量测试股票列表 (代码.交易所):"))
         self.stocks_edit = QtWidgets.QTextEdit()
-        self.stocks_edit.setPlaceholderText("请输入股票，一行一个，格式例如:\n000630.SZSE\n000001.SZSE\n600519.SSE\n002594.SZSE\n601318.SSE")
-        self.stocks_edit.setText("000630.SZSE\n000001.SZSE\n600519.SSE\n002594.SZSE\n601318.SSE")
+        self.stocks_edit.setPlaceholderText("请输入股票，一行一个，格式例如:\n000630.SZSE\n000001.SZSE\n600519.SSE\n002594.SZSE\n601318.SSE\n002511.SZSE\n600030.SSE")
+        self.stocks_edit.setText("000630.SZSE\n000001.SZSE\n600519.SSE\n002594.SZSE\n601318.SSE\n002511.SZSE\n600030.SSE")
         left_layout.addWidget(self.stocks_edit)
 
         # 📅 回测时间段选择
@@ -1304,6 +1304,9 @@ class BatchBacktestApp(QtWidgets.QMainWindow):
             return
             
         vt_symbol = item.text()
+        if "汇总" in vt_symbol:
+            return
+            
         engine = self.backtest_engines.get(vt_symbol, None)
         data_row = self.results_data.get(vt_symbol, None)
 
@@ -1327,11 +1330,137 @@ class BatchBacktestApp(QtWidgets.QMainWindow):
         self.export_btn.setEnabled(True)
         self.tab_widget.setCurrentIndex(0)
         
-        QtWidgets.QMessageBox.information(
-            self, 
-            "批量回测大功告成", 
-            "恭喜！所有所选股票的历史批量回测已运行完成！\n💡 双击表格中的任意股票行即可进入原汁原味的成交、K线、每日盈亏复盘！"
-        )
+        # ── 🎯 灵魂计算：计算批量回测全局汇总报表指标 ──
+        if self.results_data:
+            total_net_pnl = 0.0
+            total_commission = 0.0
+            total_trades = 0
+            returns = []
+            annual_returns = []
+            dd_pcts = []
+            sharpes = []
+            win_stocks = 0
+            total_stocks = len(self.results_data)
+            
+            for key, data in self.results_data.items():
+                try:
+                    # 清理并转换格式化字符串为浮点数
+                    pnl_val = float(data["total_net_pnl"].replace(",", "").replace("¥", ""))
+                    comm_val = float(data["total_commission"].replace(",", "").replace("¥", ""))
+                    trade_val = int(data["total_trade_count"].replace(",", ""))
+                    ret_val = float(data["total_return"].replace("%", "").replace(",", ""))
+                    ann_val = float(data["annual_return"].replace("%", "").replace(",", ""))
+                    dd_val = float(data["max_ddpercent"].replace("%", "").replace(",", ""))
+                    sharpe_val = float(data["sharpe_ratio"].replace(",", ""))
+                    
+                    total_net_pnl += pnl_val
+                    total_commission += comm_val
+                    total_trades += trade_val
+                    returns.append(ret_val)
+                    annual_returns.append(ann_val)
+                    dd_pcts.append(dd_val)
+                    sharpes.append(sharpe_val)
+                    
+                    if pnl_val > 0:
+                        win_stocks += 1
+                except Exception as e_calc:
+                    print(f"[SUMMARY_CALC] 解析单股数据失败: {e_calc}")
+
+            # 计算平均值和胜率
+            avg_return = sum(returns) / len(returns) if returns else 0.0
+            avg_annual_return = sum(annual_returns) / len(annual_returns) if annual_returns else 0.0
+            avg_dd = sum(dd_pcts) / len(dd_pcts) if dd_pcts else 0.0
+            max_dd = min(dd_pcts) if dd_pcts else 0.0 # 最大回撤为负值，因此最小值是最差情况
+            avg_sharpe = sum(sharpes) / len(sharpes) if sharpes else 0.0
+            win_rate = (win_stocks / total_stocks) * 100.0 if total_stocks else 0.0
+
+            # 1. 在表格底部追加一行“汇总平均”行，采用独特的蓝色极佳高亮显示
+            summary_row = self.table_widget.rowCount()
+            self.table_widget.insertRow(summary_row)
+            
+            headers_keys = [
+                "vt_symbol", "start_date", "end_date", "total_days", "profit_days",
+                "loss_days", "capital", "end_balance", "total_net_pnl", "total_commission",
+                "total_return", "annual_return", "max_drawdown", "max_ddpercent", "max_drawdown_duration",
+                "total_trade_count", "sharpe_ratio"
+            ]
+            
+            summary_data = {
+                "vt_symbol": "📊 汇总平均",
+                "start_date": "-",
+                "end_date": "-",
+                "total_days": "-",
+                "profit_days": "-",
+                "loss_days": "-",
+                "capital": "-",
+                "end_balance": "-",
+                "total_net_pnl": f"{total_net_pnl:,.2f}",
+                "total_commission": f"{total_commission:,.2f}",
+                "total_return": f"{avg_return:.2f}%",
+                "annual_return": f"{avg_annual_return:.2f}%",
+                "max_drawdown": "-",
+                "max_ddpercent": f"{avg_dd:.2f}%",
+                "max_drawdown_duration": "-",
+                "total_trade_count": str(total_trades),
+                "sharpe_ratio": f"{avg_sharpe:.2f}"
+            }
+            
+            for col, key in enumerate(headers_keys):
+                item = QtWidgets.QTableWidgetItem(summary_data[key])
+                item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                
+                # 🚨 灵魂优化：使用尊贵暗色调底色 (深蓝灰)，完美融入暗黑模式，并解决白底白字的对比度灾难！
+                item.setBackground(QtGui.QColor(38, 52, 74))
+                item.setFont(QtGui.QFont("Segoe UI", 10, QtGui.QFont.Weight.Bold))
+                
+                # 🚨 必须对所有列都显式设定前景字色，防止暗黑模式下默认的白色/浅灰色字在亮色背景下失效！
+                if key in ["total_return", "annual_return", "total_net_pnl"]:
+                    val = float(summary_data[key].replace("%", "").replace(",", ""))
+                    if val > 0:
+                        item.setForeground(QtGui.QColor(255, 100, 100)) # 鲜艳亮红
+                    elif val < 0:
+                        item.setForeground(QtGui.QColor(100, 255, 100)) # 鲜艳亮绿
+                    else:
+                        item.setForeground(QtGui.QColor(240, 240, 240)) # 亮白色
+                elif key in ["max_ddpercent"]:
+                    item.setForeground(QtGui.QColor(100, 180, 255)) # 鲜艳天蓝
+                elif key == "vt_symbol":
+                    item.setForeground(QtGui.QColor(255, 215, 0)) # 尊贵金黄色高亮标题
+                else:
+                    item.setForeground(QtGui.QColor(240, 240, 240)) # 亮白色，确保手续费、成交笔数、夏普比率等文字完美清晰！
+                
+                self.table_widget.setItem(summary_row, col, item)
+
+            # 2. 弹出一个豪华大字报式的汇总大视窗弹窗
+            msg_box = QtWidgets.QMessageBox(self)
+            msg_box.setWindowTitle("🏆 批量回测大功告成！")
+            msg_box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+            
+            summary_html = f"""
+            <h3>🎉 所有选定股票的历史批量回测已全部完成！</h3>
+            <hr/>
+            <table border="0" cellpadding="5" cellspacing="0" style="font-size: 13px;">
+                <tr><td><b>📈 平均总收益率:</b></td><td style="color:{'#ff3c3c' if avg_return >= 0 else '#3cff3c'}; font-size: 15px;"><b>{avg_return:.2f}%</b></td></tr>
+                <tr><td><b>📅 平均年化收益率:</b></td><td style="color:{'#ff3c3c' if avg_annual_return >= 0 else '#3cff3c'}; font-size: 14px;"><b>{avg_annual_return:.2f}%</b></td></tr>
+                <tr><td><b>🛡️ 平均最大回撤:</b></td><td style="color:#0078d4;"><b>{avg_dd:.2f}%</b></td></tr>
+                <tr><td><b>💥 最差个股最大回撤:</b></td><td style="color:#e81123;"><b>{max_dd:.2f}%</b></td></tr>
+                <tr><td><b>📊 平均夏普比率:</b></td><td><b>{avg_sharpe:.2f}</b></td></tr>
+                <tr><td><b>🎯 组合总盈亏:</b></td><td style="color:{'#ff3c3c' if total_net_pnl >= 0 else '#3cff3c'}; font-size: 14px;"><b>¥{total_net_pnl:,.2f}</b></td></tr>
+                <tr><td><b>💰 总交易手续费:</b></td><td>¥{total_commission:,.2f}</td></tr>
+                <tr><td><b>🤝 盈利个股胜率:</b></td><td style="color:#d83b01;"><b>{win_rate:.1f}% ({win_stocks}/{total_stocks})</b></td></tr>
+                <tr><td><b>🔄 总交易笔数:</b></td><td>{total_trades} 笔</td></tr>
+            </table>
+            <hr/>
+            <p style="color:#555;">💡 <i>双击下方表格中的任意个股行，即可进入包含成交、K线及盈亏曲线的交互式复盘窗口！</i></p>
+            """
+            msg_box.setText(summary_html)
+            msg_box.exec()
+        else:
+            QtWidgets.QMessageBox.information(
+                self, 
+                "批量回测完成", 
+                "恭喜！历史批量回测已运行完成！"
+            )
 
     def export_to_csv(self):
         if not self.results_data:

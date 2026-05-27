@@ -104,7 +104,31 @@ class ChartWizardWidget(QtWidgets.QWidget):
         if "LOCAL" not in vt_symbol:
             contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
             if not contract:
-                return
+                # 🚨 离线/无接口连接模式：允许显示本地数据库已存有历史K线图表的股票
+                try:
+                    from vnpy.trader.utility import extract_vt_symbol
+                    symbol, exchange = extract_vt_symbol(vt_symbol)
+                    
+                    from vnpy.trader.database import get_database
+                    db = get_database()
+                    overviews = db.get_bar_overview()
+                    
+                    # 检查本地是否有这个合约的历史K线概览数据
+                    has_data = any(ov.symbol == symbol and ov.exchange == exchange for ov in overviews)
+                    if not has_data:
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "新建图表失败",
+                            f"找不到合约或本地历史数据：【{vt_symbol}】\n\n提示：请输入有效的格式如 600519.SSE，且本地数据库必须先拥有该股票的历史数据。"
+                        )
+                        return
+                except Exception as e_parse:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "格式输入错误",
+                        f"合约代码格式无效：{e_parse}\n请按照 '代码.交易所' 格式输入，例如 '600519.SSE'"
+                    )
+                    return
 
         # Get selected interval and query range from UI
         combo_text = self.interval_combo.currentText()
