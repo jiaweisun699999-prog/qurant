@@ -10,200 +10,359 @@ from vnpy_ctastrategy import (
     ArrayManager,
 )
 
-
 class StockQuantStrategy(CtaTemplate):
     """
-    A股极致多因子分批建仓与持仓上限控制策略 (Stock Quant Multi-Factor Max-Pos Strategy)
-    
-    【交易规则】
-    1. 连跌7天信号：若收盘价连续7天下跌，直接买入 10% 仓位。
-    2. 历史百分之80之后信号（价格处于历史最低 20% 分位数）：买入 10% 仓位。
-    3. 前3天最低价信号：若今天收盘价是前3天最低价，买入 5% 仓位。
-    4. 仓位硬性控制：最大允许同时持有 5 个活跃子仓位（最多占用 50% 资金），一旦达到上限，强制锁定不再加仓，留存 50% 现金！
-    5. 每个子仓位均独立计算，盈利达到 +3.5% 时果断止盈抛出，回流现金。
+    逻辑自进化V5：趋势跟踪引擎
+    主要改进：
+    1. 趋势判定：双均线金叉 + 长期均线确认，取消ADX硬阈值
+    2. 入场：回调至中期均线附近的低吸信号，辅以突破近期高点
+    3. 出场：宽幅移动止损，分段止盈目标调高，移除时间止损
+    4. 风险管理：动态仓位，保留账户回撤与连续亏损暂停
+    5. 市场环境：可选基准过滤，也可仅用长期均线
     """
 
-    author = "Antigravity Quant"
+    author = "Antigravity Quant - Evolved V5"
 
-    # 策略参数
-    total_capital: float = 1000000.0   # 初始总资金 (100万)
-    profit_target: float = 0.035       # 止盈点数 (3.5%)
-    max_sub_positions: int = 5         # 最大允许同时持有的子仓位数量 (上限控制)
-    fall_days: int = 7                 # 连续下跌天数门槛
-    percentile_threshold: float = 20.0 # 历史价格分位数门槛 (低于该百分比，即排在历史80%之后)
-    lowest_days: int = 3               # 最低价比较天数
+    # 资金参数
+    total_capital: float = 1_000_000.0
+    risk_per_trade: float = 0.01            # 单笔风险比例（动态权益）
+    max_position_pct: float = 0.25          # 单次入场最大市值占比
 
-    # 策略变量
-    current_cash: float = 1000000.0    # 动态现金余额
-    active_pos_count: int = 0          # 当前活跃的子仓位数量
+    # 趋势均线参数
+    fast_ema_period: int = 20
+    slow_ema_period: int = 60
+    very_slow_ema_period: int = 120
+
+    # 回调入场
+    pullback_tolerance: float = 0.015       # 价格接近中期均线的最大偏离
+    pullback_lookback: int = 5              # 回调确认需要近期最低点接近均线
+
+    # 突破入场
+    breakout_period: int = 60               # 唐奇安通道周期
+
+    # 成交量参考
+    vol_period: int = 20
+
+    # ATR与止损
+    atr_period: int = 14
+    initial_atr_stop: float = 3.0           # 初始追踪止损 ATR 倍数
+    stop_atr_profit1: float = 2.0           # 盈利 >10% 时的 ATR 倍数
+    stop_atr_profit2: float = 1.5           # 盈利 >20% 时的 ATR 倍数
+    profit_level1: float = 0.10
+    profit_level2: float = 0.20
+
+    # 分段止盈
+    target1: float = 0.30
+    target2: float = 0.50
+    target3: float = 0.80
+    sell_ratio1: float = 0.20               # 第一目标卖出20%
+    sell_ratio2: float = 0.20               # 第二目标再卖20%
+    # 第三目标清仓
+
+    # 风控
+    max_acct_dd_pause: float = 0.15         # 账户回撤超15%暂停
+    acct_dd_reduce: float = 0.10            # 回撤超10%风险减半
+    max_consecutive_losses: int = 4
+
+    # 基准过滤
+    benchmark_ma_period: int = 60
+    use_benchmark: bool = True
+    benchmark_symbol: str = "000300.SHSE"
+
+    # 变量
+    current_cash: float = 0.0
+    fast_ema: float = 0.0
+    slow_ema: float = 0.0
+    very_slow_ema: float = 0.0
+    atr: float = 0.0
+    consecutive_losses: int = 0
+    is_market_uptrend: bool = True
+    account_peak_value: float = 0.0
+    is_trading_paused: bool = False
+    current_risk_pct: float = 0.0
 
     parameters = [
         "total_capital",
-        "profit_target",
-        "max_sub_positions",
-        "fall_days",
-        "percentile_threshold",
-        "lowest_days"
+        "risk_per_trade",
+        "max_position_pct",
+        "fast_ema_period",
+        "slow_ema_period",
+        "very_slow_ema_period",
+        "pullback_tolerance",
+        "pullback_lookback",
+        "breakout_period",
+        "vol_period",
+        "atr_period",
+        "initial_atr_stop",
+        "stop_atr_profit1",
+        "stop_atr_profit2",
+        "profit_level1",
+        "profit_level2",
+        "target1",
+        "target2",
+        "target3",
+        "sell_ratio1",
+        "sell_ratio2",
+        "max_acct_dd_pause",
+        "acct_dd_reduce",
+        "max_consecutive_losses",
+        "benchmark_ma_period",
+        "use_benchmark",
     ]
     variables = [
         "current_cash",
-        "active_pos_count"
+        "fast_ema",
+        "slow_ema",
+        "very_slow_ema",
+        "atr",
+        "consecutive_losses",
+        "is_market_uptrend",
+        "account_peak_value",
+        "is_trading_paused",
+        "current_risk_pct",
     ]
 
     def on_init(self) -> None:
-        """
-        策略初始化回调
-        """
-        self.write_log("A股极致多因子策略初始化...")
-
-        # 实例化指标管理器，容量设为 500 天以获取更长周期的历史价格对比
+        self.write_log("策略V5初始化...")
+        max_period = max(
+            self.very_slow_ema_period,
+            self.breakout_period,
+            self.atr_period + 50
+        ) + 200
+        self.am: ArrayManager = ArrayManager(size=max_period)
         self.bg: BarGenerator = BarGenerator(self.on_bar)
-        self.am: ArrayManager = ArrayManager(size=500)
 
-        # 维护一个独立的子仓位列表，格式为: [{"buy_price": xx, "volume": xx, "target_price": xx}]
-        self.sub_positions: list[dict] = []
+        # 基准指数
+        self.benchmark_am: ArrayManager = ArrayManager(size=max_period)
+        self.bg_benchmark: BarGenerator = BarGenerator(
+            self.on_bar, window=1, on_window_bar=self.on_benchmark_bar
+        )
+
+        self.sub_positions: list = []
         self.current_cash = self.total_capital
-
-        # 预热加载 500 天历史 K 线数据以供分位数计算
-        self.load_bar(500)
+        self.account_peak_value = self.total_capital
+        self.current_risk_pct = self.risk_per_trade
+        self.load_bar(max_period)
 
     def on_start(self) -> None:
-        """
-        策略启动回调
-        """
-        self.write_log("A股极致多因子策略启动！")
+        self.write_log("策略V5启动")
         self.put_event()
 
     def on_stop(self) -> None:
-        """
-        策略停止回调
-        """
-        self.write_log("A股极致多因子策略停止。")
+        self.write_log("策略V5停止")
         self.put_event()
 
     def on_tick(self, tick: TickData) -> None:
-        """
-        实时 Tick 更新
-        """
-        self.bg.update_tick(tick)
+        if tick.vt_symbol == self.vt_symbol:
+            self.bg.update_tick(tick)
+        elif tick.vt_symbol == self.benchmark_symbol:
+            self.bg_benchmark.update_tick(tick)
 
     def on_bar(self, bar: BarData) -> None:
-        """
-        每日 K 线收盘更新
-        """
         self.cancel_all()
-
-        # 1. 独立仓位止盈检查 (Check Take Profit for each sub-position)
-        # 遍历已持有的子仓位，检查今日是否达到了 +3.5% 的止盈价
-        keep_positions = []
-        for pos_item in self.sub_positions:
-            buy_price = pos_item["buy_price"]
-            volume = pos_item["volume"]
-            target_price = pos_item["target_price"]
-
-            # 如果今天最高价达到了止盈目标价，执行止盈抛出
-            if bar.high_price >= target_price:
-                self.write_log(f"【止盈触发】子仓位入场价 {buy_price:.2f} 已盈利3.5%，以目标价 {target_price:.2f} 抛出 {volume} 股")
-                self.sell(target_price, volume)
-                self.current_cash += volume * target_price
-            else:
-                keep_positions.append(pos_item)
-        
-        self.sub_positions = keep_positions
-        self.active_pos_count = len(self.sub_positions)
-
-        # 2. 更新指标管理器
-        am: ArrayManager = self.am
+        am = self.am
         am.update_bar(bar)
         if not am.inited:
             return
 
-        # 3. 提取历史收盘价数据用于条件判断
-        close_array = am.close
-        current_close = bar.close_price
+        close = bar.close_price
+        high = bar.high_price
+        low = bar.low_price
+        volume = bar.volume
 
-        # ── 信号 1：连续下跌7天 ──
-        is_falling_7 = True
-        for i in range(-self.fall_days, 0):
-            if close_array[i] >= close_array[i-1]:
-                is_falling_7 = False
-                break
+        # 指标更新
+        self.fast_ema = am.ema(self.fast_ema_period)
+        self.slow_ema = am.ema(self.slow_ema_period)
+        self.very_slow_ema = am.ema(self.very_slow_ema_period)
+        self.atr = am.atr(self.atr_period)
 
-        # ── 信号 2：股价处于历史分位数最低 20%（即排在80%之后） ──
-        smaller_count = sum(1 for p in close_array if p < current_close)
-        percentile = (smaller_count / len(close_array)) * 100.0
-        is_bottom_percentile = percentile <= self.percentile_threshold
+        # 账户状态
+        acct_value = self.current_cash + sum(
+            p["volume"] * close for p in self.sub_positions
+        )
+        self.account_peak_value = max(self.account_peak_value, acct_value)
+        dd = (self.account_peak_value - acct_value) / self.account_peak_value if self.account_peak_value > 0 else 0.0
 
-        # ── 信号 3：股价是前3天的最低价 ──
-        is_lowest_3 = current_close < min(close_array[-4:-1])
+        if dd >= self.max_acct_dd_pause:
+            self.current_risk_pct = 0.0
+            self.is_trading_paused = True
+        elif dd >= self.acct_dd_reduce:
+            self.current_risk_pct = self.risk_per_trade * 0.5
+            self.is_trading_paused = False
+        else:
+            self.current_risk_pct = self.risk_per_trade
+            self.is_trading_paused = False
 
-        # 4. 执行买入建仓逻辑（必须在活跃仓位数小于上限时才触发）
-        
-        # 信号 1：连跌7天买入 10% 仓位
-        if len(self.sub_positions) < self.max_sub_positions:
-            if is_falling_7:
-                buy_capital = self.total_capital * 0.10
-                volume = int(buy_capital / current_close / 100) * 100
-                
-                if volume > 0 and self.current_cash >= (volume * current_close):
-                    self.write_log(f"【买入信号】收盘价连续{self.fall_days}天下跌！触发10%建仓：价格 {current_close:.2f}，数量 {volume}")
-                    self.buy(current_close, volume)
-                    self.current_cash -= volume * current_close
-                    self.sub_positions.append({
-                        "buy_price": current_close,
-                        "volume": volume,
-                        "target_price": current_close * (1.0 + self.profit_target)
-                    })
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            self.is_trading_paused = True
 
-        # 信号 2：最低 20% 历史分位买入 10% 仓位
-        if len(self.sub_positions) < self.max_sub_positions:
-            if is_bottom_percentile:
-                buy_capital = self.total_capital * 0.10
-                volume = int(buy_capital / current_close / 100) * 100
-                
-                if volume > 0 and self.current_cash >= (volume * current_close):
-                    self.write_log(f"【买入信号】股价进入历史最低{self.percentile_threshold}%分位(排在80%后)！触发10%建仓：价格 {current_close:.2f}，数量 {volume}")
-                    self.buy(current_close, volume)
-                    self.current_cash -= volume * current_close
-                    self.sub_positions.append({
-                        "buy_price": current_close,
-                        "volume": volume,
-                        "target_price": current_close * (1.0 + self.profit_target)
-                    })
+        # 市场环境
+        if self.use_benchmark and self.benchmark_am.inited:
+            bm_close = self.benchmark_am.close[-1]
+            bm_ma = self.benchmark_am.ema(self.benchmark_ma_period)
+            self.is_market_uptrend = bm_close > bm_ma
+        else:
+            self.is_market_uptrend = close > self.very_slow_ema
 
-        # 信号 3：前3天最低价买入 5% 仓位
-        if len(self.sub_positions) < self.max_sub_positions:
-            if is_lowest_3:
-                buy_capital = self.total_capital * 0.05
-                volume = int(buy_capital / current_close / 100) * 100
-                
-                if volume > 0 and self.current_cash >= (volume * current_close):
-                    self.write_log(f"【买入信号】股价创前{self.lowest_days}天新低！触发5%建仓：价格 {current_close:.2f}，数量 {volume}")
-                    self.buy(current_close, volume)
-                    self.current_cash -= volume * current_close
-                    self.sub_positions.append({
-                        "buy_price": current_close,
-                        "volume": volume,
-                        "target_price": current_close * (1.0 + self.profit_target)
-                    })
+        vol_ma = np.mean(am.volume[-self.vol_period:]) if am.count >= self.vol_period else volume
+        vol_ratio = volume / vol_ma if vol_ma > 0 else 1.0
 
-        self.active_pos_count = len(self.sub_positions)
+        # ──── 管理现有持仓 ────
+        keep = []
+        for pos in self.sub_positions:
+            entry_price = pos["buy_price"]
+            shares = pos["volume"]
+            pos["highest"] = max(high, pos.get("highest", entry_price))
+            highest = pos["highest"]
+            profit = (close - entry_price) / entry_price
+
+            # 移动止损计算
+            if profit < self.profit_level1:
+                stop_mult = self.initial_atr_stop
+            elif profit < self.profit_level2:
+                stop_mult = self.stop_atr_profit1
+            else:
+                stop_mult = self.stop_atr_profit2
+
+            trail_stop = highest - self.atr * stop_mult
+            # 保本止损
+            if profit > 0.05:
+                trail_stop = max(trail_stop, entry_price)
+
+            # 更新 trailing_stop
+            pos["trailing_stop"] = max(pos.get("trailing_stop", trail_stop), trail_stop)
+
+            # 价格触发移动止损
+            if low <= pos["trailing_stop"]:
+                self._close_pos(pos, max(pos["trailing_stop"], low), "移动止损")
+                continue
+
+            # 终极清仓：跌破长期均线
+            if close < self.very_slow_ema:
+                self._close_pos(pos, close, "跌破长期均线")
+                continue
+
+            # 分段止盈
+            sell_vol = 0
+            if profit >= self.target3 and not pos.get("t3_hit", False):
+                sell_vol = shares  # 清仓
+                pos["t3_hit"] = True
+            elif profit >= self.target2 and not pos.get("t2_hit", False):
+                sell_vol = int(shares * self.sell_ratio2 / 100) * 100
+                pos["t2_hit"] = True
+            elif profit >= self.target1 and not pos.get("t1_hit", False):
+                sell_vol = int(shares * self.sell_ratio1 / 100) * 100
+                pos["t1_hit"] = True
+                # 剩余仓位保本
+                pos["trailing_stop"] = max(pos["trailing_stop"], entry_price)
+
+            if sell_vol > 0:
+                if sell_vol >= shares:
+                    self._close_pos(pos, close, f"分段止盈{profit*100:.1f}%清仓")
+                    continue
+                else:
+                    self.sell(close, sell_vol)
+                    self.current_cash += sell_vol * close
+                    pos["volume"] -= sell_vol
+                    self.consecutive_losses = 0
+                    self.write_log(f"部分止盈 {sell_vol}股 @{close:.2f}")
+
+            if pos["volume"] > 0:
+                keep.append(pos)
+
+        self.sub_positions = keep
+
+        # ──── 入场条件 ────
+        if self.sub_positions or self.is_trading_paused:
+            self.put_event()
+            return
+
+        # 趋势确认：快线在慢线上方，价格在长期均线上方
+        trend_ok = (self.fast_ema > self.slow_ema) and (close > self.very_slow_ema)
+
+        # 市场辅助过滤
+        if not self.is_market_uptrend:
+            trend_ok = False
+
+        if not trend_ok:
+            self.put_event()
+            return
+
+        # 信号1：回调到中期均线附近
+        pullback_ma = self.slow_ema  # 使用慢速均线作为回调参考
+        near_ma = abs(low - pullback_ma) / pullback_ma < self.pullback_tolerance
+        # 最近5根K线有低点接近均线
+        recent_lows = am.low[-self.pullback_lookback:]
+        near_recent = any(abs(l - pullback_ma) / pullback_ma < self.pullback_tolerance for l in recent_lows)
+        bullish_candle = close > bar.open_price
+        signal_pullback = near_ma and near_recent and bullish_candle
+
+        # 信号2：突破近期高点
+        highest_br = am.high[-self.breakout_period:].max()
+        signal_breakout = close > highest_br and bullish_candle
+
+        if not (signal_pullback or signal_breakout):
+            self.put_event()
+            return
+
+        # 计算初始止损 (基于ATR)
+        if signal_pullback:
+            stop_price = low - self.atr * 2.0
+        else:
+            stop_price = highest_br - self.atr * 2.0
+        stop_price = max(stop_price, 0.01)
+
+        # 仓位计算
+        risk_share = close - stop_price
+        if risk_share <= 0:
+            risk_share = self.atr * 2.0
+        max_loss = acct_value * self.current_risk_pct
+        vol_risk = int(max_loss / risk_share / 100) * 100
+        vol_cash = int(self.current_cash * self.max_position_pct / close / 100) * 100
+        final_vol = min(vol_risk, vol_cash)
+        if final_vol < 100:
+            # 若不足100股且条件允许，以100股入场，控制风险
+            if vol_cash >= 100:
+                final_vol = 100
+            else:
+                self.put_event()
+                return
+
+        self.buy(close, final_vol)
+        self.current_cash -= final_vol * close
+        self.sub_positions.append({
+            "buy_price": close,
+            "volume": final_vol,
+            "trailing_stop": stop_price,
+            "highest": close,
+            "t1_hit": False,
+            "t2_hit": False,
+            "t3_hit": False,
+        })
+        msg = f"买入 {final_vol}股 @{close:.2f} 止损{stop_price:.2f}"
+        self.write_log(msg)
         self.put_event()
 
+    def on_benchmark_bar(self, bar: BarData) -> None:
+        if bar.vt_symbol == self.benchmark_symbol:
+            self.benchmark_am.update_bar(bar)
+
+    def _close_pos(self, pos: dict, price: float, reason: str) -> None:
+        vol = pos["volume"]
+        self.sell(price, vol)
+        self.current_cash += vol * price
+        pnl_pct = (price - pos["buy_price"]) / pos["buy_price"]
+        if pnl_pct > 0:
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+        self.write_log(f"平仓 {vol}股 @{price:.2f} 原因:{reason} 盈亏:{pnl_pct*100:.2f}%")
+
     def on_order(self, order: OrderData) -> None:
-        """
-        委托单状态更新
-        """
         pass
 
     def on_trade(self, trade: TradeData) -> None:
-        """
-        成交细节更新
-        """
         self.put_event()
 
     def on_stop_order(self, stop_order: StopOrder) -> None:
-        """
-        本地止损单更新
-        """
         pass

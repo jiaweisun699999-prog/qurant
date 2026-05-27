@@ -99,7 +99,14 @@ def run_single_backtest(symbol: str, exchange_str: str, start_date: datetime, en
     )
     
     # 挂载策略
-    engine.add_strategy(StockDoubleMaStrategy, {})
+    engine.add_strategy(StockQuantStrategy, {})
+
+    # 在大括号内填入您想测试的临时参数，它会自动覆盖策略中的默认设定！
+    # engine.add_strategy(StockQuantStrategy, {
+    #     "profit_target": 0.05,        # 临时将止盈设为 5%
+    #     "max_sub_positions": 3,       # 临时将持仓限制在最多3个
+    #     "fall_days": 5                # 临时将连跌门槛降为5天
+    # })
     
     # 载入本地数据并执行回测
     engine.load_data()

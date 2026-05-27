@@ -1,0 +1,412 @@
+import numpy as np
+from vnpy_ctastrategy import (
+    CtaTemplate,
+    StopOrder,
+    TickData,
+    BarData,
+    TradeData,
+    OrderData,
+    BarGenerator,
+    ArrayManager,
+)
+
+class StockQuantStrategy(CtaTemplate):
+    """
+    【逻辑自进化V4】强化趋势过滤、自适应风控与多层级出场
+    主要改进：
+    1. 趋势判别：ADX>25，+DI>-DI，长期均线过滤
+    2. 入场优化：回调需缩量企稳，突破需放量且RSI适中
+    3. 风险管理：基于动态权益的动态仓位，回撤自适应降仓/暂停
+    4. 出场：阶梯式吊灯止损、时间止损、修正分段止盈逻辑
+    5. 市场环境：沪深300指数过滤或内部长期均线替代
+    """
+
+    author = "Antigravity Quant - Evolved V4"
+
+    # 策略参数
+    total_capital: float = 1_000_000.0
+    risk_per_trade: float = 0.01              # 单笔风险比例（动态权益，1%）
+    max_position_pct: float = 0.25            # 单次入场占用动态权益最大比例
+
+    # 趋势确认参数
+    fast_ema_period: int = 20
+    slow_ema_period: int = 60
+    very_slow_ema_period: int = 120           # 长期牛熊分界线
+    adx_period: int = 14
+    adx_threshold: int = 25                   # 提升阈值
+    di_period: int = 14                       # +DI/-DI 周期
+
+    # 回调入场参数
+    pullback_ma_period: int = 20
+    pullback_tolerance: float = 0.015         # 1.5% 容忍度
+    vol_ratio_threshold_bull: float = 1.2     # 放量确认（突破时）
+    vol_ratio_threshold_bear: float = 0.8     # 缩量确认（回调时）
+
+    # 突破入场参数
+    breakout_period: int = 60
+    rsi_period: int = 14
+    rsi_upper: float = 70.0
+    rsi_lower: float = 40.0
+
+    # 风险管理参数
+    atr_period: int = 14
+    initial_stop_atr_mult: float = 2.0        # 初始止损ATR倍数
+    initial_stop_lookback: int = 20           # 初始止损参考近期低点周期
+    chandelier_atr_mult_high: float = 3.0     # 初期吊灯止损ATR倍数 (盈利<5%)
+    chandelier_atr_mult_mid: float = 2.5      # 盈利5%~15%
+    chandelier_atr_mult_low: float = 1.5      # 盈利>15%
+    max_holding_days: int = 40                # 时间止损天数
+    min_hold_profit_pct: float = 0.02         # 持仓超时强制平仓的盈利阈值
+
+    # 账户风控参数
+    max_account_dd_pause: float = 0.12        # 账户回撤暂停阈值（12%）
+    account_dd_reduce_risk: float = 0.08      # 回撤超8%，风险比例减半
+    max_consecutive_losses: int = 4           # 连续亏损暂停阈值
+
+    # 分段止盈参数
+    profit_target_1: float = 0.15
+    profit_target_2: float = 0.30
+    profit_target_3: float = 0.50
+    profit_sell_ratio_1: float = 0.3
+    profit_sell_ratio_2: float = 0.3
+    profit_sell_ratio_3: float = 1.0          # 第三目标清仓
+
+    # 市场环境参数
+    benchmark_ma_period: int = 60
+    benchmark_symbol: str = "000300.SHSE"
+    use_benchmark: bool = True                # 是否启用基准指数过滤
+
+    # 策略变量
+    current_cash: float = 0.0
+    active_pos_count: int = 0
+    fast_ema: float = 0.0
+    slow_ema: float = 0.0
+    very_slow_ema: float = 0.0
+    adx_value: float = 0.0
+    plus_di: float = 0.0
+    minus_di: float = 0.0
+    rsi: float = 0.0
+    atr: float = 0.0
+    consecutive_losses: int = 0
+    is_market_uptrend: bool = True
+    account_peak_value: float = 0.0
+    is_trading_paused: bool = False
+    current_risk_pct: float = 0.0            # 动态风险比例
+
+    parameters = [
+        "total_capital",
+        "risk_per_trade",
+        "max_position_pct",
+        "fast_ema_period",
+        "slow_ema_period",
+        "very_slow_ema_period",
+        "adx_period",
+        "adx_threshold",
+        "di_period",
+        "pullback_ma_period",
+        "pullback_tolerance",
+        "vol_ratio_threshold_bull",
+        "vol_ratio_threshold_bear",
+        "breakout_period",
+        "rsi_period",
+        "rsi_upper",
+        "rsi_lower",
+        "atr_period",
+        "initial_stop_atr_mult",
+        "initial_stop_lookback",
+        "chandelier_atr_mult_high",
+        "chandelier_atr_mult_mid",
+        "chandelier_atr_mult_low",
+        "max_holding_days",
+        "min_hold_profit_pct",
+        "max_account_dd_pause",
+        "account_dd_reduce_risk",
+        "max_consecutive_losses",
+        "profit_target_1",
+        "profit_target_2",
+        "profit_target_3",
+        "profit_sell_ratio_1",
+        "profit_sell_ratio_2",
+        "profit_sell_ratio_3",
+        "benchmark_ma_period",
+        "use_benchmark",
+    ]
+    variables = [
+        "current_cash",
+        "active_pos_count",
+        "fast_ema",
+        "slow_ema",
+        "very_slow_ema",
+        "adx_value",
+        "plus_di",
+        "minus_di",
+        "rsi",
+        "atr",
+        "consecutive_losses",
+        "is_market_uptrend",
+        "account_peak_value",
+        "is_trading_paused",
+        "current_risk_pct",
+    ]
+
+    def on_init(self) -> None:
+        self.write_log("逻辑自进化策略V4初始化...")
+        max_period = max(
+            self.very_slow_ema_period,
+            self.breakout_period,
+            self.atr_period + self.initial_stop_lookback,
+            self.di_period + self.adx_period,
+        ) + 200
+        self.am: ArrayManager = ArrayManager(size=max_period)
+        self.bg: BarGenerator = BarGenerator(self.on_bar)
+
+        # 基准指数数据流
+        self.benchmark_am: ArrayManager = ArrayManager(size=max_period)
+        self.bg_benchmark: BarGenerator = BarGenerator(
+            self.on_bar, window=1, on_window_bar=self.on_benchmark_bar
+        )
+
+        self.sub_positions: list[dict] = []
+        self.current_cash = self.total_capital
+        self.account_peak_value = self.total_capital
+        self.current_risk_pct = self.risk_per_trade
+        self.load_bar(max_period)
+
+    def on_start(self) -> None:
+        self.write_log("逻辑自进化策略V4启动！")
+        self.put_event()
+
+    def on_stop(self) -> None:
+        self.write_log("逻辑自进化策略V4停止。")
+        self.put_event()
+
+    def on_tick(self, tick: TickData) -> None:
+        if tick.vt_symbol == self.vt_symbol:
+            self.bg.update_tick(tick)
+        elif tick.vt_symbol == self.benchmark_symbol:
+            self.bg_benchmark.update_tick(tick)
+
+    def on_bar(self, bar: BarData) -> None:
+        self.cancel_all()
+        am: ArrayManager = self.am
+        am.update_bar(bar)
+        if not am.inited:
+            return
+
+        current_close = bar.close_price
+        current_high = bar.high_price
+        current_low = bar.low_price
+        current_volume = bar.volume
+
+        # 更新技术指标
+        self.fast_ema = am.ema(self.fast_ema_period)
+        self.slow_ema = am.ema(self.slow_ema_period)
+        self.very_slow_ema = am.ema(self.very_slow_ema_period)
+        self.adx_value = am.adx(self.adx_period)
+        self.plus_di = am.plus_di(self.di_period)
+        self.minus_di = am.minus_di(self.di_period)
+        self.rsi = am.rsi(self.rsi_period)
+        self.atr = am.atr(self.atr_period)
+
+        # ──── 账户状态与市场环境检查 ────
+        current_account_value = self.current_cash + sum(
+            p.get("volume", 0) * current_close for p in self.sub_positions
+        )
+        self.account_peak_value = max(self.account_peak_value, current_account_value)
+        account_dd = (
+            (self.account_peak_value - current_account_value) / self.account_peak_value
+            if self.account_peak_value > 0 else 0.0
+        )
+
+        # 动态风险比例
+        if account_dd >= self.max_account_dd_pause:
+            self.current_risk_pct = 0.0
+            self.is_trading_paused = True
+        elif account_dd >= self.account_dd_reduce_risk:
+            self.current_risk_pct = self.risk_per_trade * 0.5
+            self.is_trading_paused = False
+        else:
+            self.current_risk_pct = self.risk_per_trade
+            self.is_trading_paused = False
+
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            self.is_trading_paused = True
+
+        # 市场趋势过滤器（基准指数 或 内部长期均线）
+        if self.use_benchmark and self.benchmark_am.inited:
+            benchmark_ma = self.benchmark_am.ema(self.benchmark_ma_period)
+            benchmark_close = self.benchmark_am.close[-1]
+            self.is_market_uptrend = benchmark_close > benchmark_ma
+        else:
+            # 备用：自身120EMA作为长期牛熊线
+            self.is_market_uptrend = current_close > self.very_slow_ema
+
+        # 成交量均值和比例
+        vol_ma20 = np.mean(am.volume[-20:]) if am.count >= 20 else current_volume
+        vol_ratio = current_volume / vol_ma20 if vol_ma20 > 0 else 1.0
+
+        # ──── 现有持仓管理 ────
+        keep_positions = []
+        for pos in self.sub_positions:
+            buy_price = pos["buy_price"]
+            volume = pos["volume"]
+            pos["bars_in_trade"] = pos.get("bars_in_trade", 0) + 1
+            pos["highest_since_entry"] = max(current_high, pos.get("highest_since_entry", current_high))
+            highest = pos["highest_since_entry"]
+            profit_ratio = (current_close - buy_price) / buy_price
+
+            # 1. 初始止损
+            initial_stop = pos.get("initial_stop", 0.0)
+            if current_low <= initial_stop:
+                self._close_position(pos, max(initial_stop, current_low), "初始止损")
+                continue
+
+            # 2. 阶梯式吊灯止损
+            if profit_ratio < 0.05:
+                atr_mult = self.chandelier_atr_mult_high
+            elif profit_ratio < 0.15:
+                atr_mult = self.chandelier_atr_mult_mid
+            else:
+                atr_mult = self.chandelier_atr_mult_low
+            chandelier_stop = highest - self.atr * atr_mult
+            trailing_stop = max(pos.get("trailing_stop", initial_stop), chandelier_stop)
+            pos["trailing_stop"] = trailing_stop
+
+            if current_low <= trailing_stop:
+                self._close_position(pos, max(trailing_stop, current_low), "吊灯止损")
+                continue
+
+            # 3. 时间止损
+            if pos["bars_in_trade"] >= self.max_holding_days and profit_ratio < self.min_hold_profit_pct:
+                self._close_position(pos, current_close, "时间止损")
+                continue
+
+            # 4. 分段止盈（检查并执行，可能部分卖出）
+            sell_volume = 0
+            if profit_ratio >= self.profit_target_3 and not pos.get("target3_hit", False):
+                sell_volume = int(volume * self.profit_sell_ratio_3 / 100) * 100
+                pos["target3_hit"] = True
+            elif profit_ratio >= self.profit_target_2 and not pos.get("target2_hit", False):
+                sell_volume = int(volume * self.profit_sell_ratio_2 / 100) * 100
+                pos["target2_hit"] = True
+            elif profit_ratio >= self.profit_target_1 and not pos.get("target1_hit", False):
+                sell_volume = int(volume * self.profit_sell_ratio_1 / 100) * 100
+                pos["target1_hit"] = True
+                # 剩余仓位止损提至保本
+                pos["trailing_stop"] = max(pos.get("trailing_stop", initial_stop), buy_price)
+
+            if sell_volume > 0 and sell_volume <= volume:
+                if sell_volume == volume:
+                    self._close_position(pos, current_close, f"止盈{profit_ratio*100:.1f}%清仓")
+                    continue
+                else:
+                    self.sell(current_close, sell_volume)
+                    self.current_cash += sell_volume * current_close
+                    pos["volume"] -= sell_volume
+                    self.consecutive_losses = 0
+                    self.write_log(f"【部分止盈】盈利{profit_ratio*100:.1f}%，卖出{sell_volume}股")
+
+            # 保留剩余仓位
+            if pos["volume"] > 0:
+                keep_positions.append(pos)
+
+        self.sub_positions = keep_positions
+        self.active_pos_count = len(self.sub_positions)
+
+        # ──── 入场信号扫描（无持仓且允许交易） ────
+        if self.active_pos_count > 0 or self.is_trading_paused or not self.is_market_uptrend:
+            self.put_event()
+            return
+
+        # 趋势条件
+        trend_up = (current_close > self.slow_ema) and (self.fast_ema > self.slow_ema)
+        strong_trend = self.adx_value > self.adx_threshold and self.plus_di > self.minus_di
+        trend_confirmed = trend_up and strong_trend
+
+        # 回调入场信号
+        pullback_ma = am.ema(self.pullback_ma_period)
+        near_ma = abs(current_low - pullback_ma) / pullback_ma < self.pullback_tolerance
+        bullish_candle = current_close > bar.open_price
+        vol_shrink = vol_ratio < self.vol_ratio_threshold_bear  # 缩量
+        signal_pullback = trend_confirmed and near_ma and bullish_candle and vol_shrink
+
+        # 突破入场信号
+        breakout_high = am.high[-self.breakout_period:].max()
+        is_breakout = current_close > breakout_high and bullish_candle
+        vol_expand = vol_ratio > self.vol_ratio_threshold_bull
+        rsi_ok = self.rsi_lower < self.rsi < self.rsi_upper
+        signal_breakout = trend_confirmed and is_breakout and vol_expand and rsi_ok
+
+        buy_signal = signal_pullback or signal_breakout
+        if not buy_signal:
+            self.put_event()
+            return
+
+        # 计算初始止损
+        if signal_pullback:
+            lookback_low = am.low[-self.initial_stop_lookback:].min()
+            initial_stop = min(current_low - self.atr * self.initial_stop_atr_mult, lookback_low)
+        else:  # breakout
+            initial_stop = breakout_high - self.atr * self.initial_stop_atr_mult
+        initial_stop = max(initial_stop, 0.01)
+
+        # 仓位计算（基于动态权益与动态风险比例）
+        risk_per_share = current_close - initial_stop
+        if risk_per_share <= 0:
+            risk_per_share = self.atr * self.initial_stop_atr_mult * 0.5
+        max_loss = current_account_value * self.current_risk_pct
+        volume_by_risk = int(max_loss / risk_per_share / 100) * 100
+        volume_by_cash = int(self.current_cash * self.max_position_pct / current_close / 100) * 100
+        final_volume = min(volume_by_risk, volume_by_cash)
+
+        if final_volume < 100:
+            self.put_event()
+            return
+
+        entry_type = "回调买入" if signal_pullback else "突破买入"
+        self.write_log(
+            f"【{entry_type}】ADX={self.adx_value:.1f}, +DI={self.plus_di:.1f}, "
+            f"价格{current_close:.2f}, 止损{initial_stop:.2f}, 仓位{final_volume}股"
+        )
+        self.buy(current_close, final_volume)
+        self.current_cash -= final_volume * current_close
+        self.sub_positions.append({
+            "buy_price": current_close,
+            "volume": final_volume,
+            "initial_stop": initial_stop,
+            "trailing_stop": initial_stop,
+            "highest_since_entry": current_high,
+            "bars_in_trade": 0,
+            "entry_type": entry_type,
+            "target1_hit": False,
+            "target2_hit": False,
+            "target3_hit": False,
+        })
+        self.active_pos_count = len(self.sub_positions)
+        self.put_event()
+
+    def on_benchmark_bar(self, bar: BarData) -> None:
+        if bar.vt_symbol == self.benchmark_symbol:
+            self.benchmark_am.update_bar(bar)
+
+    def _close_position(self, pos: dict, price: float, reason: str) -> None:
+        volume = pos["volume"]
+        self.sell(price, volume)
+        self.current_cash += volume * price
+        profit_ratio = (price - pos["buy_price"]) / pos["buy_price"]
+        if profit_ratio > 0:
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+        self.write_log(f"【{reason}】卖出{volume}股@{price:.2f}, 盈亏{profit_ratio*100:.2f}%")
+
+    def on_order(self, order: OrderData) -> None:
+        pass
+
+    def on_trade(self, trade: TradeData) -> None:
+        # 实际成交同步（防御性处理），现金已在决策时预调整，此处不再重复
+        # 如需严格一致，可在此根据trade更新current_cash
+        self.put_event()
+
+    def on_stop_order(self, stop_order: StopOrder) -> None:
+        pass

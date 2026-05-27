@@ -47,3 +47,7 @@ venv/
 venv_quant/
 .venv/
 ENV/
+
+# Quant Config
+ai_config.json
+
